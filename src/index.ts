@@ -231,6 +231,133 @@ app.post<{ Body: ChatBody }>(
   },
 );
 
+
+type Message = {
+  role: "user" | "assistant";
+  content: string;
+};
+
+const conversations = new Map<string, Message[]>();
+
+// Create a new conversation
+app.post("/ai/conversations", async (_request, reply) => {
+  const conversationId = crypto.randomUUID();
+
+  conversations.set(conversationId, []);
+
+  return reply.code(201).send({ conversationId });
+});
+
+// Send a message within an existing conversation
+app.post<{
+  Params: { conversationId: string };
+  Body: { question: string };
+}>(
+  "/ai/conversations/:conversationId/chat",
+  {
+    schema: {
+      params: {
+        type: "object",
+        required: ["conversationId"],
+        properties: {
+          conversationId: { type: "string", format: "uuid" },
+        },
+      },
+      body: {
+        type: "object",
+        required: ["question"],
+        additionalProperties: false,
+        properties: {
+          question: {
+            type: "string",
+            minLength: 1,
+            maxLength: 2000,
+          },
+        },
+      },
+    },
+  },
+  async (request, reply) => {
+    const { conversationId } = request.params;
+    const question = request.body.question.trim();
+
+    if (!question) {
+      return reply.code(400).send({
+        error: "Question cannot be empty",
+      });
+    }
+
+    const history = conversations.get(conversationId);
+
+    if (!history) {
+      return reply.code(404).send({
+        error: "Conversation not found",
+      });
+    }
+
+    // Keep the most recent 20 messages (10 user/assistant turns).
+    const recentHistory = history.slice(-20);
+
+    try {
+      const response = await openrouter.chat.send({
+        chatRequest: {
+          model,
+          messages: [
+            {
+              role: "system",
+              content: "You are a helpful programming assistant.",
+            },
+            ...recentHistory,
+            {
+              role: "user",
+              content: question,
+            },
+          ],
+          stream: false,
+        },
+      });
+
+      if (response instanceof ReadableStream) {
+        return reply.code(502).send({
+          error: "Expected a non-streaming response",
+        });
+      }
+
+      const answer = response.choices[0]?.message.content;
+
+      if (typeof answer !== "string") {
+        return reply.code(502).send({
+          error: "AI service returned no text answer",
+        });
+      }
+
+      // Save both sides only after a successful response.
+      const updatedHistory: Message[] = [
+        ...recentHistory,
+        { role: "user", content: question },
+        { role: "assistant", content: answer },
+      ];
+
+      conversations.set(conversationId, updatedHistory);
+
+      return {
+        conversationId,
+        answer,
+        messageCount: updatedHistory.length,
+      };
+    } catch (error) {
+      request.log.error(
+        { err: error },
+        "Conversation request failed",
+      );
+
+      return reply.code(502).send({
+        error: "AI service request failed",
+      });
+    }
+  },
+);
+
 app.addHook("onClose", async () => {
   app.log.info("Fastify server shutting down");
 });
